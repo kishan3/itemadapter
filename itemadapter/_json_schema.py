@@ -196,38 +196,37 @@ def code_unit_ranges(ranges: Iterable[tuple[int, int]]) -> str:
     )
 
 
-def split_ranges(escape_letter: str, *, ascii_only: bool = False) -> tuple[str, list[str]]:
+def split_ranges(escape_letter: str) -> tuple[str, list[str]]:
     r"""Return the Python escape sequence ``\<escape_letter>`` as the body of
     an ECMA-262 character class that covers the characters in the Basic
-    Multilingual Plane, and a list of ECMA-262 alternatives, each made of a
+    Multilingual Plane, and a list of ECMA-262 alternatives, each a full
     surrogate pair, that cover the rest.
 
-    ECMA-262 patterns without the ``u`` flag, which are the ones JSON Schema
-    uses, read strings as UTF-16 code units, so characters above U+FFFF can
-    only be matched through their surrogate pairs."""
-    if ascii_only:
-        assert escape_letter == "s"
-        return ASCII_SPACE_RANGES, []
+    Characters above U+FFFF are written as full surrogate pairs because, in
+    ECMA-262 patterns, a pair matches the character both with the ``u`` flag,
+    which the JSON Schema test suite assumes, and without it, where patterns
+    read strings as UTF-16 code units. Ranges of low surrogates, as in
+    ``\\uD835[\\uDFCE-\\uDFFF]``, would only work without it."""
     basic: list[tuple[int, int]] = []
-    low_surrogates_by_high_surrogate: dict[int, list[tuple[int, int]]] = {}
-    for range_first, range_last in unicode_ranges(escape_letter):
+    alternatives: list[str] = []
+    for first, last in unicode_ranges(escape_letter):
         # No range of the supported escape sequences crosses U+FFFF.
-        if range_last <= 0xFFFF:
-            basic.append((range_first, range_last))
+        if last <= 0xFFFF:
+            basic.append((first, last))
             continue
-        first = range_first - 0x10000
-        last = range_last - 0x10000
-        for high in range(first >> 10, (last >> 10) + 1):
-            low_first = (first & 0x3FF) if high == first >> 10 else 0
-            low_last = (last & 0x3FF) if high == last >> 10 else 0x3FF
-            low_surrogates_by_high_surrogate.setdefault(high, []).append(
-                (0xDC00 + low_first, 0xDC00 + low_last)
+        for code_point in range(first, last + 1):
+            offset = code_point - 0x10000
+            alternatives.append(
+                escape_code_unit(0xD800 + (offset >> 10))
+                + escape_code_unit(0xDC00 + (offset & 0x3FF))
             )
-    alternatives = [
-        f"{escape_code_unit(0xD800 + high)}[{code_unit_ranges(lows)}]"
-        for high, lows in low_surrogates_by_high_surrogate.items()
-    ]
     return code_unit_ranges(basic), alternatives
+
+
+def space_ranges(*, ascii_only: bool) -> str:
+    r"""Return the body of an ECMA-262 character class that matches what
+    ``\s`` matches in Python."""
+    return ASCII_SPACE_RANGES if ascii_only else split_ranges("s")[0]
 
 
 def translate_unicode_escape(escape_letter: str, *, ascii_only: bool) -> str | None:
@@ -238,12 +237,11 @@ def translate_unicode_escape(escape_letter: str, *, ascii_only: bool) -> str | N
         # ranges) to spell them out, and the Unicode-aware word boundaries
         # \b and \B cannot be expressed at all.
         return None
-    if escape_letter == "S":
-        return f"[^{split_ranges('s', ascii_only=ascii_only)[0]}]"
-    basic, alternatives = split_ranges(escape_letter, ascii_only=ascii_only)
-    if not alternatives:
-        return f"[{basic}]"
-    return "(?:" + "|".join([f"[{basic}]", *alternatives]) + ")"
+    if escape_letter == "d":
+        basic, alternatives = split_ranges("d")
+        return "(?:" + "|".join([f"[{basic}]", *alternatives]) + ")"
+    caret = "^" if escape_letter == "S" else ""
+    return f"[{caret}{space_ranges(ascii_only=ascii_only)}]"
 
 
 def scan_escape(
@@ -288,6 +286,12 @@ def scan_escape(
     return index + 2, pattern[index : index + 2]
 
 
+# Pairs of shorthand escape sequences that match every character together,
+# which they do in both Python and ECMA-262, regardless of what each of them
+# matches.
+COMPLEMENTARY_SHORTHANDS = ("dD", "sS", "wW")
+
+
 def scan_class(pattern: str, index: int, *, ascii_only: bool) -> tuple[int, str] | None:
     """Return the ECMA-262 translation of the character class that starts at
     *index*, along with the index right after it, or ``None`` if that class
@@ -305,15 +309,23 @@ def scan_class(pattern: str, index: int, *, ascii_only: bool) -> tuple[int, str]
     # escapes, which can only be spelled out as surrogate pairs outside the
     # class.
     alternatives: list[str] = []
+    shorthands: set[str] = set()
+    translatable = True
     while index < len(pattern):
         char = pattern[index]
         if char == "]":
+            if any(set(pair) <= shorthands for pair in COMPLEMENTARY_SHORTHANDS):
+                return index + 1, rf"[{'^' if negated else ''}\s\S]"
+            if not translatable:
+                return None
             text = f"[{'^' if negated else ''}{''.join(members)}]"
             if alternatives:
                 text = f"(?:{'|'.join([text, *alternatives])})"
             return index + 1, text
         if char == "\\":
             letter = pattern[index + 1 : index + 2]
+            if letter in UNICODE_ESCAPE_LETTERS and letter != "b":
+                shorthands.add(letter)
             if (
                 letter in UNICODE_ESCAPE_LETTERS
                 and letter != "b"
@@ -322,11 +334,16 @@ def scan_class(pattern: str, index: int, *, ascii_only: bool) -> tuple[int, str]
                 # \s can be spelled out within the class. \d can be as well,
                 # but only if the class is not negated, as the characters
                 # above U+FFFF that it matches are not part of the class.
-                if letter not in "ds" or (letter == "d" and negated):
-                    return None
-                basic, extra = split_ranges(letter, ascii_only=ascii_only)
-                members.append(basic)
-                alternatives.extend(extra)
+                if letter == "s":
+                    members.append(space_ranges(ascii_only=ascii_only))
+                elif letter == "d" and not negated:
+                    basic, extra = split_ranges("d")
+                    members.append(basic)
+                    alternatives.extend(extra)
+                else:
+                    # The class may still be spelled out as a whole if it
+                    # also has the complementary escape sequence.
+                    translatable = False
                 index += 2
                 continue
             escape = scan_escape(pattern, index, in_class=True, ascii_only=ascii_only)
