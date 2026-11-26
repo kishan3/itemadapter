@@ -143,7 +143,7 @@ SHARED_ESCAPE_LETTERS = frozenset("fnrtv")
 # ASCII characters only, so they can be copied as they are. \s and \S still
 # need translating, as they match fewer characters than they do in ECMA-262.
 #
-# Without re.ASCII, only \d, \s and \S can be translated, because the others
+# Without re.ASCII, only \s and \S can be translated, because the others
 # match too many characters to spell them out, or cannot be expressed at all.
 UNICODE_ESCAPE_LETTERS = frozenset("dDsSwWbB")
 
@@ -168,80 +168,39 @@ SHARED_GROUP_PREFIXES = ("(?:", "(?=", "(?!", "(?<=", "(?<!")
 
 
 @cache
-def unicode_ranges(escape_letter: str) -> tuple[tuple[int, int], ...]:
-    r"""Return the (first, last) code point ranges that the Python escape
-    sequence ``\<escape_letter>`` matches in a Unicode pattern.
+def unicode_space_ranges() -> str:
+    r"""Return the body of an ECMA-262 character class that matches what
+    ``\s`` matches in a Python Unicode pattern.
 
     The ranges are read from Python itself, so they always match the Unicode
-    version of the running interpreter."""
-    all_code_points = "".join(map(chr, range(0x110000)))
-    return tuple(
-        (match.start(), match.end() - 1)
-        for match in re.finditer(rf"\{escape_letter}+", all_code_points)
-    )
-
-
-def escape_code_unit(code_unit: int) -> str:
-    return f"\\u{code_unit:04X}"
-
-
-def code_unit_ranges(ranges: Iterable[tuple[int, int]]) -> str:
-    """Return the body of an ECMA-262 character class for the given ranges,
-    which must all be in the Basic Multilingual Plane."""
+    version of the running interpreter. They are all in the Basic Multilingual
+    Plane."""
+    code_points = "".join(map(chr, range(0x10000)))
     return "".join(
-        escape_code_unit(first)
-        if first == last
-        else f"{escape_code_unit(first)}-{escape_code_unit(last)}"
-        for first, last in ranges
+        f"\\u{match.start():04X}"
+        if match.end() - match.start() == 1
+        else f"\\u{match.start():04X}-\\u{match.end() - 1:04X}"
+        for match in re.finditer(r"\s+", code_points)
     )
-
-
-def split_ranges(escape_letter: str) -> tuple[str, list[str]]:
-    r"""Return the Python escape sequence ``\<escape_letter>`` as the body of
-    an ECMA-262 character class that covers the characters in the Basic
-    Multilingual Plane, and a list of ECMA-262 alternatives, each a full
-    surrogate pair, that cover the rest.
-
-    Characters above U+FFFF are written as full surrogate pairs because, in
-    ECMA-262 patterns, a pair matches the character both with the ``u`` flag,
-    which the JSON Schema test suite assumes, and without it, where patterns
-    read strings as UTF-16 code units. Ranges of low surrogates, as in
-    ``\\uD835[\\uDFCE-\\uDFFF]``, would only work without it."""
-    basic: list[tuple[int, int]] = []
-    alternatives: list[str] = []
-    for first, last in unicode_ranges(escape_letter):
-        # No range of the supported escape sequences crosses U+FFFF.
-        if last <= 0xFFFF:
-            basic.append((first, last))
-            continue
-        for code_point in range(first, last + 1):
-            offset = code_point - 0x10000
-            alternatives.append(
-                escape_code_unit(0xD800 + (offset >> 10))
-                + escape_code_unit(0xDC00 + (offset & 0x3FF))
-            )
-    return code_unit_ranges(basic), alternatives
-
-
-def space_ranges(*, ascii_only: bool) -> str:
-    r"""Return the body of an ECMA-262 character class that matches what
-    ``\s`` matches in Python."""
-    return ASCII_SPACE_RANGES if ascii_only else split_ranges("s")[0]
 
 
 def translate_unicode_escape(escape_letter: str, *, ascii_only: bool) -> str | None:
     r"""Return the Python escape sequence ``\<escape_letter>``, used outside a
     character class, as an ECMA-262 one, or ``None`` if there is none."""
-    if escape_letter not in "dsS":
-        # \D, \w and \W match too many characters (\w alone covers hundreds of
-        # ranges) to spell them out, and the Unicode-aware word boundaries
-        # \b and \B cannot be expressed at all.
+    if escape_letter not in "sS":
+        # \d and \w match too many characters (\w alone covers hundreds of
+        # ranges, \d over 300 characters, many of them above U+FFFF) to spell
+        # them out, \D and \W are their complements, and the Unicode-aware
+        # word boundaries \b and \B cannot be expressed at all.
         return None
-    if escape_letter == "d":
-        basic, alternatives = split_ranges("d")
-        return "(?:" + "|".join([f"[{basic}]", *alternatives]) + ")"
     caret = "^" if escape_letter == "S" else ""
     return f"[{caret}{space_ranges(ascii_only=ascii_only)}]"
+
+
+def space_ranges(*, ascii_only: bool) -> str:
+    r"""Return the body of an ECMA-262 character class that matches what
+    ``\s`` matches in Python."""
+    return ASCII_SPACE_RANGES if ascii_only else unicode_space_ranges()
 
 
 def scan_escape(
@@ -292,6 +251,22 @@ def scan_escape(
 COMPLEMENTARY_SHORTHANDS = ("dD", "sS", "wW")
 
 
+def close_class(
+    members: list[str], shorthands: set[str], *, negated: bool, translatable: bool
+) -> str | None:
+    """Return the ECMA-262 character class made of the given translated
+    *members*, or ``None`` if the class has no ECMA-262 equivalent.
+
+    *shorthands* are the shorthand escape sequences of the original class, and
+    *translatable* indicates whether all of them could be translated."""
+    caret = "^" if negated else ""
+    if any(set(pair) <= shorthands for pair in COMPLEMENTARY_SHORTHANDS):
+        return rf"[{caret}\s\S]"
+    if not translatable:
+        return None
+    return f"[{caret}{''.join(members)}]"
+
+
 def scan_class(pattern: str, index: int, *, ascii_only: bool) -> tuple[int, str] | None:
     """Return the ECMA-262 translation of the character class that starts at
     *index*, along with the index right after it, or ``None`` if that class
@@ -305,41 +280,21 @@ def scan_class(pattern: str, index: int, *, ascii_only: bool) -> tuple[int, str]
         # empty class.
         return None
     members: list[str] = []
-    # Characters above U+FFFF that the class matches through shorthand
-    # escapes, which can only be spelled out as surrogate pairs outside the
-    # class.
-    alternatives: list[str] = []
     shorthands: set[str] = set()
     translatable = True
     while index < len(pattern):
         char = pattern[index]
         if char == "]":
-            if any(set(pair) <= shorthands for pair in COMPLEMENTARY_SHORTHANDS):
-                return index + 1, rf"[{'^' if negated else ''}\s\S]"
-            if not translatable:
-                return None
-            text = f"[{'^' if negated else ''}{''.join(members)}]"
-            if alternatives:
-                text = f"(?:{'|'.join([text, *alternatives])})"
-            return index + 1, text
+            text = close_class(members, shorthands, negated=negated, translatable=translatable)
+            return None if text is None else (index + 1, text)
         if char == "\\":
             letter = pattern[index + 1 : index + 2]
-            if letter in UNICODE_ESCAPE_LETTERS and letter != "b":
+            is_shorthand = letter in UNICODE_ESCAPE_LETTERS and letter != "b"
+            if is_shorthand:
                 shorthands.add(letter)
-            if (
-                letter in UNICODE_ESCAPE_LETTERS
-                and letter != "b"
-                and (not ascii_only or letter in "sS")
-            ):
-                # \s can be spelled out within the class. \d can be as well,
-                # but only if the class is not negated, as the characters
-                # above U+FFFF that it matches are not part of the class.
+            if is_shorthand and (not ascii_only or letter in "sS"):
                 if letter == "s":
                     members.append(space_ranges(ascii_only=ascii_only))
-                elif letter == "d" and not negated:
-                    basic, extra = split_ranges("d")
-                    members.append(basic)
-                    alternatives.extend(extra)
                 else:
                     # The class may still be spelled out as a whole if it
                     # also has the complementary escape sequence.

@@ -335,7 +335,7 @@ itemadapter:
 
 -   String pattern contraints are translated to the regular expression dialect
     of JSON Schema where possible, and silently ignored where not, e.g. when
-    they are case-insensitive or multiline. Shorthand escapes like `\d` are
+    they are case-insensitive or multiline. Shorthand escapes like `\s` are
     translated where possible, and the pattern is ignored where not.
 
 -   Recursion is silently ignored: if you have an item class that has an
